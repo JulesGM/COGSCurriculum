@@ -117,7 +117,7 @@ class EM(OurMetric):
             print(f"{prepped_label =   }")
 
         if prepped_decoded == prepped_label:
-            self.exact_matches += 1
+            self.correct += 1
         self.total += 1 
     
     def compute(self, *args, **kwargs):
@@ -241,8 +241,8 @@ class PLBart(pl.LightningModule):
             
             self.log(f"{name}_loss",           loss,               **self.logging_conf)
             self.log(f"{name}_EM",             em_acc_val,         **self.logging_conf)
-            self.log(f"{name}_recall_ACC",     recall_acc_val,     **self.logging_conf)
-            self.log(f"{name}_precision_ACC",  precision_acc_val,  **self.logging_conf)
+            # self.log(f"{name}_recall_ACC",     recall_acc_val,     **self.logging_conf)
+            # self.log(f"{name}_precision_ACC",  precision_acc_val,  **self.logging_conf)
             self.log(f"{name}_f1_ACC",         f1_ACC,             **self.logging_conf)
 
         return loss
@@ -308,9 +308,9 @@ GENERATION_KWARGS = dict(
 )
 
 RUN_NAME = "FIRST"
-VAL_CHECK_INTERVAL = 60
+VAL_CHECK_INTERVAL = None
 LOG_EVERY_N_STEPS = 1
-LIMIT_VAL_BATCHES = 4
+LIMIT_VAL_BATCHES = None
 
 RANDOM_SEED = 42
 

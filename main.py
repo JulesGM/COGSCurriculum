@@ -292,7 +292,6 @@ assert NUM_TOTAL_BATCH_SEEN % TRAIN_BATCH_SIZE == 0, (
     f"{NUM_TOTAL_BATCH_SEEN % TRAIN_BATCH_SIZE} != 0"
 )
 
-
 GENERATION_KWARGS = dict(
     num_beams=4
 )
@@ -323,7 +322,7 @@ def main(
     eval_x, eval_y =   load_dataset(EVAL_PATH)
     gen_x, gen_y =     load_dataset(GEN_PATH)
 
-    train_ds = prepare_ds(, train_x, train_y)
+    train_ds = prepare_ds(tokenizer, train_x, train_y)
     eval_ds =  prepare_ds(tokenizer, eval_x, eval_y)
     gen_ds =   prepare_ds(tokenizer, gen_x, gen_y)
 

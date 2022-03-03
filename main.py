@@ -176,24 +176,29 @@ class PLBart(pl.LightningModule):
             tokenizer, 
             train_ds, 
             eval_ds, 
+            gen_ds, 
             train_batch_size, 
             eval_batch_size, 
             num_workers_dl, 
-            metrics, 
             generation_kwargs,
+            seed,
         ):
         super().__init__()
         self.model = model
         self.train_ds = train_ds
         self.eval_ds = eval_ds
+        self.gen_ds = gen_ds
         self.tokenizer = tokenizer
         self.batch_size = train_batch_size
         self.eval_batch_size = eval_batch_size
-        self.metrics = metrics
         self.num_workers_dl = num_workers_dl
         self.generation_kwargs = generation_kwargs
         self.learning_rate = 1e-4
         self.logging_conf = dict(prog_bar=True, on_step=True, on_epoch=True, logger=True)
+
+        self.shuffle_seed_train = seed
+        self.shuffle_seed_eval = seed + 1
+        self.shuffle_seed_gen = seed + 2
 
     def forward(self, *args, **kwargs):
         return self.model(*args, **kwargs)
@@ -204,7 +209,6 @@ class PLBart(pl.LightningModule):
         return loss
 
     def validation_step(self, batch_package, batch_idx):
-
         for name, batch in batch_package.items():
             loss = self(**batch).loss
 
@@ -258,16 +262,16 @@ class PLBart(pl.LightningModule):
         ) 
 
     def train_dataloader(self):
-        return self.make_dataloader(self.train_ds, self.batch_size)
+        return self.make_dataloader(self.train_ds, self.batch_size).shuffle(self.shuffle_seed_train)
 
     def val_dataloader(self):
         return dict(
             eval=self.make_dataloader(
-                self.eval_ds.shuffle(seed=random.randint(0, 2**31 - 1)),
+                self.eval_ds.shuffle(seed=self.shuffle_seed_eval),
                 self.eval_batch_size
             ), 
             gen=self.make_dataloader(
-                self.eval_ds.shuffle(seed=random.randint(0, 2**31 - 1)),
+                self.eval_ds.shuffle(seed=self.shuffle_seed_gen),
                 self.eval_batch_size
             ), 
         )
@@ -286,6 +290,8 @@ GEN_MD5 = "e6d4a859a25af9ba3319b2a27815a181"
 
 NUM_WORKERS_DL = int(cmd("nproc")[0])
 MODEL_NAME = "facebook/bart-base"
+
+TRAIN_MAX_EPOCHS = 80
 NUM_TOTAL_BATCH_SEEN = 64 * 8
 TRAIN_BATCH_SIZE = 64 * 2
 EVAL_BATCH_SIZE = TRAIN_BATCH_SIZE
@@ -305,9 +311,11 @@ VAL_CHECK_INTERVAL = 60
 LOG_EVERY_N_STEPS = 1
 LIMIT_VAL_BATCHES = 4
 
+WANDB_ENTITY = "julesgm"
+RANDOM_SEED = 42
 
-def main(eval_or_gen="eval"):
-    wandb.config.eval_or_gen = eval_or_gen
+
+def main():
 
     # These are tiny DS, probably
     maybe_download(TRAIN_PATH, TRAIN_URL, TRAIN_MD5)
@@ -323,39 +331,31 @@ def main(eval_or_gen="eval"):
     gen_x, gen_y = load_dataset(GEN_PATH, tokenizer)
 
     train_ds = prepare_ds(tokenizer, train_x, train_y)
-    if eval_or_gen == "eval":
-        ds_being_used_at_eval = prepare_ds(tokenizer, eval_x, eval_y)
-    elif eval_or_gen == "gen":
-        ds_being_used_at_eval = prepare_ds(tokenizer, gen_x, gen_y)
-    else:
-        raise ValueError(
-            f"eval_or_gen must be either 'eval' or 'gen', not {eval_or_gen}"
-        )
-
-    metrics = {
-        "accuracy": datasets.load_metric("accuracy"),
-        "f1": datasets.load_metric("f1"),
-        "precision": datasets.load_metric("precision"),
-        "recall": datasets.load_metric("recall"),
-        "rouge": datasets.load_metric("rouge"),
-    }
+    eval_ds = prepare_ds(tokenizer, eval_x, eval_y)
+    gen_ds = prepare_ds(tokenizer, gen_x, gen_y)
 
     pl_model = PLBart(
         model=model, 
         tokenizer=tokenizer, 
         train_ds=train_ds, 
-        eval_ds=ds_being_used_at_eval,
+        eval_ds=eval_ds,
+        gen_ds=gen_ds,
         train_batch_size=TRAIN_BATCH_SIZE, 
         eval_batch_size=EVAL_BATCH_SIZE, 
         num_workers_dl=NUM_WORKERS_DL, 
-        metrics=metrics,
         generation_kwargs=GENERATION_KWARGS,
+        seed=RANDOM_SEED,
     )
     trainer = pl.Trainer(
-        max_epochs=80, 
+        max_epochs=TRAIN_MAX_EPOCHS, 
         accelerator="gpu", 
         devices=1, 
-        logger=pl.loggers.WandbLogger(project=PROJECT_NAME, name=RUN_NAME, log_model=False, entity="julesgm"),
+        logger=pl.loggers.WandbLogger(
+            project=PROJECT_NAME, 
+            name=RUN_NAME, 
+            log_model=False, 
+            entity=WANDB_ENTITY
+        ),
         val_check_interval=VAL_CHECK_INTERVAL,
         log_every_n_steps=LOG_EVERY_N_STEPS,
         limit_val_batches=LIMIT_VAL_BATCHES,

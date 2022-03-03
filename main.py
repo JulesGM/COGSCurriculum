@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # coding: utf-8
 import os
+from beartype import beartype
 import numpy as np
 from pathlib import Path
 import shlex
@@ -25,7 +26,6 @@ except ImportError:
 def cmd(cmd):
     if isinstance(cmd, list):
         cmd = shlex.join(cmd)
-
     return subprocess.check_output(cmd, shell=True).strip().decode().split("\n")
 
 
@@ -58,8 +58,14 @@ def load_dataset(path):
 
 def prepare_ds(tokenizer, x, y):
     ds = datasets.Dataset.from_dict(dict(x=x, y=y))
-    ds = ds.map(lambda example: tokenizer(example["x"], truncation=True), remove_columns=["x"])
-    ds = ds.map(lambda example: dict(labels=tokenizer(example["y"], truncation=True)["input_ids"]), remove_columns=["y"])
+    ds = ds.map(
+        lambda example: tokenizer(example["x"], truncation=True), 
+        remove_columns=["x"],
+    )
+    ds = ds.map(
+        lambda example: dict(labels=tokenizer(example["y"], truncation=True)["input_ids"]), 
+        remove_columns=["y"],
+    )
     return ds
 
 
@@ -77,8 +83,7 @@ class OurMetric:
         assert 1 in things_to_ignore, things_to_ignore
         assert 2 in things_to_ignore, things_to_ignore
 
-
-        cleaned_preds = [x for x in  pred.cpu().numpy().tolist() if x not in things_to_ignore],
+        cleaned_preds = [x for x in  pred.cpu().numpy().tolist() if x not in things_to_ignore]
         cleaned_labels = [x for x in label.cpu().numpy().tolist() if x not in things_to_ignore]
 
         if do_print:
@@ -103,7 +108,7 @@ class EM(OurMetric):
         self.total = 0
         self.correct = 0
 
-    def add(self, pred, label, do_print=False):
+    def add(self, pred: list, label: list, do_print=False):
         prepped_decoded = list(pred)
         prepped_label =   list(label)
 
@@ -113,7 +118,7 @@ class EM(OurMetric):
 
         if prepped_decoded == prepped_label:
             self.exact_matches += 1
-        self.number_seen += 1 
+        self.total += 1 
     
     def compute(self, *args, **kwargs):
         return self.correct / self.total
@@ -123,7 +128,8 @@ class RecallAcc:
     def __init__(self):
         self.recall_accuracies = []
 
-    def add(self, pred, label, do_print=False):
+    @beartype
+    def add(self, pred: list, label: list, do_print: bool = False):
         recall_acc_decoded = list(pred)
         recall_acc_label = list(label)
 
@@ -146,7 +152,8 @@ class PrecisionAcc:
     def __init__(self): 
         self.precision_accuracies = []
 
-    def add(self, pred, label):
+    @beartype
+    def add(self, pred: list, label: list, do_print: bool = False):
         precision_acc_decoded = list(pred)
         precision_acc_label = list(label)
 
@@ -176,7 +183,6 @@ class PLBart(pl.LightningModule):
             eval_batch_size, 
             num_workers_dl, 
             generation_kwargs,
-            seed,
         ):
         super().__init__()
         self.model = model
@@ -191,10 +197,6 @@ class PLBart(pl.LightningModule):
         self.learning_rate = 1e-4
         self.logging_conf = dict(prog_bar=True, on_step=True, on_epoch=True, logger=True)
 
-        self.shuffle_seed_train = seed
-        self.shuffle_seed_eval = seed + 1
-        self.shuffle_seed_gen = seed + 2
-
     def forward(self, *args, **kwargs):
         return self.model(*args, **kwargs)
 
@@ -204,8 +206,7 @@ class PLBart(pl.LightningModule):
         return loss
 
     def validation_step(self, batch_package, batch_idx):
-        for name in batch_package:
-            batch = batch_package[name]
+        for name, batch in batch_package.items():
             loss = self(**batch).loss
 
             preds = self.model.generate(
@@ -226,6 +227,8 @@ class PLBart(pl.LightningModule):
 
                 clean_pred = cleaned["cleaned_preds"]
                 clean_label = cleaned["cleaned_labels"]
+                assert isinstance(clean_pred, list), type(clean_pred).mro()
+                assert isinstance(clean_label, list), type(clean_label).mro()
 
                 em                .add(clean_pred, clean_label, do_print=do_print)
                 recall_accuracy   .add(clean_pred, clean_label, do_print=do_print)
@@ -237,7 +240,7 @@ class PLBart(pl.LightningModule):
             f1_ACC =             2 * precision_acc_val * recall_acc_val / (precision_acc_val + recall_acc_val)
             
             self.log(f"{name}_loss",           loss,               **self.logging_conf)
-            self.log(f"{name}_EM",             EM,                 **self.logging_conf)
+            self.log(f"{name}_EM",             em_acc_val,         **self.logging_conf)
             self.log(f"{name}_recall_ACC",     recall_acc_val,     **self.logging_conf)
             self.log(f"{name}_precision_ACC",  precision_acc_val,  **self.logging_conf)
             self.log(f"{name}_f1_ACC",         f1_ACC,             **self.logging_conf)
@@ -255,21 +258,25 @@ class PLBart(pl.LightningModule):
             ), 
             batch_size=batch_size, 
             num_workers=self.num_workers_dl,
+            shuffle=True,
         ) 
 
     def train_dataloader(self):
-        return self.make_dataloader(self.train_ds, self.batch_size).shuffle(self.shuffle_seed_train)
+        return self.make_dataloader(self.train_ds, self.batch_size)
 
     def val_dataloader(self):
-        return dict(
-            eval=self.make_dataloader(
-                self.eval_ds.shuffle(seed=self.shuffle_seed_eval),
-                self.eval_batch_size
-            ), 
-            gen=self.make_dataloader(
-                self.eval_ds.shuffle(seed=self.shuffle_seed_gen),
-                self.eval_batch_size
-            ), 
+        return pl.trainer.supporters.CombinedLoader(
+            dict(
+                eval=self.make_dataloader(
+                    self.eval_ds,
+                    self.eval_batch_size
+                ), 
+                gen=self.make_dataloader(
+                    self.eval_ds,
+                    self.eval_batch_size
+                ), 
+            ),
+            "max_size_cycle",
         )
 
 TRAIN_PATH = "./train.tsv"
@@ -313,6 +320,9 @@ def main(
     wandb_project="cogs_curriculum",
     ):
 
+    torch.manual_seed(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
+
     # These are tiny DS, probably
     maybe_download(TRAIN_PATH, TRAIN_URL, TRAIN_MD5)
     maybe_download(EVAL_PATH, EVAL_URL, EVAL_MD5)
@@ -340,7 +350,6 @@ def main(
         eval_batch_size=EVAL_BATCH_SIZE, 
         num_workers_dl=NUM_WORKERS_DL, 
         generation_kwargs=GENERATION_KWARGS,
-        seed=RANDOM_SEED,
     )
     trainer = pl.Trainer(
         max_epochs=TRAIN_MAX_EPOCHS, 

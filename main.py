@@ -1,25 +1,16 @@
 #!/usr/bin/env python
 # coding: utf-8
-from asyncio.log import logger
-from curses.ascii import EM
-import os
-from re import I
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-import math
 import numpy as np
 from pathlib import Path
-import random
 import shlex
 import subprocess
-import pytorch_lightning as pl
 
 import datasets
+import fire
 import torch
+import pytorch_lightning as pl
 import torch.utils.data 
-import torchmetrics
 import transformers
-import wandb
 import wget
 
 try:
@@ -305,17 +296,18 @@ GENERATION_KWARGS = dict(
     num_beams=4
 )
 
-PROJECT_NAME = "cogs_curriculum"
 RUN_NAME = "FIRST"
 VAL_CHECK_INTERVAL = 60
 LOG_EVERY_N_STEPS = 1
 LIMIT_VAL_BATCHES = 4
 
-WANDB_ENTITY = "julesgm"
 RANDOM_SEED = 42
 
 
-def main():
+def main(
+    wandb_entity="julesgm", 
+    wandb_project="cogs_curriculum",
+    ):
 
     # These are tiny DS, probably
     maybe_download(TRAIN_PATH, TRAIN_URL, TRAIN_MD5)
@@ -327,12 +319,12 @@ def main():
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
 
     train_x, train_y = load_dataset(TRAIN_PATH, tokenizer)
-    eval_x, eval_y = load_dataset(EVAL_PATH, tokenizer)
-    gen_x, gen_y = load_dataset(GEN_PATH, tokenizer)
+    eval_x, eval_y =   load_dataset(EVAL_PATH, tokenizer)
+    gen_x, gen_y =     load_dataset(GEN_PATH, tokenizer)
 
     train_ds = prepare_ds(tokenizer, train_x, train_y)
-    eval_ds = prepare_ds(tokenizer, eval_x, eval_y)
-    gen_ds = prepare_ds(tokenizer, gen_x, gen_y)
+    eval_ds =  prepare_ds(tokenizer, eval_x, eval_y)
+    gen_ds =   prepare_ds(tokenizer, gen_x, gen_y)
 
     pl_model = PLBart(
         model=model, 
@@ -351,10 +343,10 @@ def main():
         accelerator="gpu", 
         devices=1, 
         logger=pl.loggers.WandbLogger(
-            project=PROJECT_NAME, 
+            project=wandb_project, 
             name=RUN_NAME, 
             log_model=False, 
-            entity=WANDB_ENTITY
+            entity=wandb_entity,
         ),
         val_check_interval=VAL_CHECK_INTERVAL,
         log_every_n_steps=LOG_EVERY_N_STEPS,
@@ -365,5 +357,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    fire.Fire(main)
 

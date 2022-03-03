@@ -1,9 +1,12 @@
 #!/usr/bin/env python
 # coding: utf-8
+import os
 import numpy as np
 from pathlib import Path
 import shlex
 import subprocess
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import datasets
 import fire
@@ -201,7 +204,8 @@ class PLBart(pl.LightningModule):
         return loss
 
     def validation_step(self, batch_package, batch_idx):
-        for name, batch in batch_package.items():
+        for name in batch_package:
+            batch = batch_package[name]
             loss = self(**batch).loss
 
             preds = self.model.generate(

@@ -18,6 +18,7 @@ try:
 except ImportError:
     pass
 
+
 def cmd(cmd):
     if isinstance(cmd, list):
         cmd = shlex.join(cmd)
@@ -41,7 +42,7 @@ def maybe_download(path, url, md5):
         wget.download(url, path)
 
 
-def load_dataset(path, tokenizer):
+def load_dataset(path):
     all_lines = Path(path).read_text().strip().split("\n")
     inputs = []
     labels = []
@@ -318,11 +319,11 @@ def main(
     model = transformers.AutoModelForSeq2SeqLM.from_pretrained(model_name)
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
 
-    train_x, train_y = load_dataset(TRAIN_PATH, tokenizer)
-    eval_x, eval_y =   load_dataset(EVAL_PATH, tokenizer)
-    gen_x, gen_y =     load_dataset(GEN_PATH, tokenizer)
+    train_x, train_y = load_dataset(TRAIN_PATH)
+    eval_x, eval_y =   load_dataset(EVAL_PATH)
+    gen_x, gen_y =     load_dataset(GEN_PATH)
 
-    train_ds = prepare_ds(tokenizer, train_x, train_y)
+    train_ds = prepare_ds(, train_x, train_y)
     eval_ds =  prepare_ds(tokenizer, eval_x, eval_y)
     gen_ds =   prepare_ds(tokenizer, gen_x, gen_y)
 

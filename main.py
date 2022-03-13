@@ -354,7 +354,7 @@ class PLBart(pl.LightningModule):
             allen_ai_preds = self.allen_ai_bart.forward(
                 source_tokens=allen_ai_inputs,
                 target_tokens=allen_ai_outputs,
-            )
+            )["predictions"]
 
             for pred_type, preds_intance in (("reg", preds), ("allen_ai", allen_ai_preds)):
                 em = EM()
@@ -454,9 +454,9 @@ class PLBart(pl.LightningModule):
 # Config.
 ###############################################################################
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# Can change.
+# CAN CHANGE.
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~.
-RUN_NAME = "LONG_GENS"
+RUN_NAME = "WITH FORCE BOS 0, WD NO LABEL SMOOTHING"
 
 RANDOM_SEED = 42
 
@@ -477,20 +477,15 @@ SCHEDULUER_TYPES = dict(
 @dataclass
 class Config:
     use_label_smoothing: bool = False
-    learning_rate: float =      (1e-4) / 0.2
+    learning_rate: float =      (1e-4) 
     is_adamw: bool =            True
     weight_decay: float =       0.01 
-    scheduler_type: str =       "linear"
-    scheduler_kwargs: dict =    field(default_factory=lambda : dict(
-            start_factor= 0.2,      
-            end_factor=   1,
-            total_iters=  5,
-        )
-    )
+    scheduler_type: str =       "no_scheduler"
+    scheduler_kwargs: dict =    field(default_factory=lambda : dict())
 
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# Should never change.
+# SHOULD NEVER CHANGE.
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 ######
 ## Batch size logic. The effective batch size (512) shouldn't change.
@@ -539,8 +534,6 @@ TRAIN_MAX_EPOCHS = 80
 NUM_WORKERS_DL = get_nprocs()
 
 
-
-
 ###############################################################################
 # Main function.
 ###############################################################################
@@ -563,7 +556,7 @@ def main(
     maybe_download(GEN_PATH,   GEN_URL,   GEN_MD5  )
 
     model_name = MODEL_NAME
-    model = transformers.AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    model = transformers.AutoModelForSeq2SeqLM.from_pretrained(model_name, forced_bos_token_id=0)
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
 
     train_x, train_y = load_dataset(TRAIN_PATH)

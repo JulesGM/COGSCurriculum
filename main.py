@@ -30,6 +30,7 @@ except ImportError:
     pass
 
 import allen_ai_bart
+import auto_curriculum
 
 ###############################################################################
 # Table of contents:
@@ -130,11 +131,6 @@ class OurMetric(abc.ABC):
         cleaned_preds = [x for x in  pred.cpu().numpy().tolist() if x not in things_to_ignore]
         cleaned_labels = [x for x in label.cpu().numpy().tolist() if x not in things_to_ignore]
 
-        # if do_print:
-        #     print("#" * 80)
-        #     print("Preds:  ", cleaned_preds)
-        #     print("Labels: ", cleaned_labels)
-
         return dict(
             cleaned_preds=cleaned_preds, 
             cleaned_labels=cleaned_labels
@@ -154,7 +150,7 @@ class EM(OurMetric):
         self.total = 0
         self.correct = 0
 
-    def add(self, pred: list, label: list, do_print=False):
+    def add(self, pred: list, label: list, do_print=False, descr=""):
         prepped_decoded = list(pred)
         prepped_label =   list(label)
 
@@ -163,26 +159,23 @@ class EM(OurMetric):
         assert is_match == is_match_np, (is_match, is_match_np)
 
         if prepped_decoded == prepped_label:
-            # rich.print("[green]Exact Match!")
             self.correct += 1
         else:
-            # rich.print("[red]Not an Exact Match!")
             pass
         
         if do_print:            
-            rich.print(f"prepped_decoded: " + ", ".join(
+            rich.print(f"prepped_decoded - {descr}: " + ", ".join(
                 [f"[green]{a}" if a == b else f"[red]{a}" for a, b 
                 in itertools.zip_longest(prepped_decoded, prepped_label, fillvalue="<None>")]
             ))
-            rich.print(f"prepped_label:   " + ", ".join(
+            rich.print(f"prepped_label - {descr}:   " + ", ".join(
                 [f"[green]{b}" if a == b else f"[red]{b}" for a, b 
                 in itertools.zip_longest(prepped_decoded, prepped_label, fillvalue="<None>")]
             ))
 
         self.total += 1 
     
-    def compute(self, *args, **kwargs):
-        rich.print(f"[orange]GOT {self.correct}/{self.total} = {self.correct/self.total:.2f}")
+    def compute(self):
         return self.correct / self.total
 
 
@@ -191,7 +184,7 @@ class RecallAcc:
         self.recall_accuracies = []
 
     @beartype
-    def add(self, pred: list, label: list, do_print: bool = False):
+    def add(self, pred: list, label: list, do_print: bool = False, descr=""):
         recall_acc_decoded = list(pred)
         recall_acc_label = list(label)
 
@@ -215,7 +208,7 @@ class PrecisionAcc:
         self.precision_accuracies = []
 
     @beartype
-    def add(self, pred: list, label: list, do_print: bool = False):
+    def add(self, pred: list, label: list, do_print: bool = False, descr=""):
         precision_acc_decoded = list(pred)
         precision_acc_label = list(label)
 
@@ -230,7 +223,7 @@ class PrecisionAcc:
 
         self.precision_accuracies.append(precision_acc) 
 
-    def compute(self):
+    def compute(self): 
         return np.mean(self.precision_accuracies)
 
 
@@ -254,6 +247,9 @@ class PLBart(pl.LightningModule):
             weight_decay,
             scheduler_type,
             scheduler_kwargs,
+            do_allen_nlp_predictions: bool,
+            curriculum_mode: str,
+            curriculum_instance,
         ):
         super().__init__()
         self.tokenizer =            tokenizer
@@ -265,6 +261,7 @@ class PLBart(pl.LightningModule):
         self.logging_conf =         dict(
             prog_bar=True, on_step=True, on_epoch=True, logger=True
         )
+        self.do_allen_nlp_predictions = do_allen_nlp_predictions
 
         # Related to datasets
         self.train_ds =             train_ds
@@ -295,6 +292,11 @@ class PLBart(pl.LightningModule):
             beam_size=generation_kwargs["num_beams"],
         )
 
+        # Curriculum
+        self.curriculum_mode =      curriculum_mode
+        self.cluster_picker =       curriculum_instance
+        self.already_started =      False
+
         if self.use_label_smoothing:
             self.label_smoother = transformers.trainer_pt_utils.LabelSmoother()
             assert self.label_smoother.epsilon == 0.1, self.label_smoother.epsilon
@@ -304,14 +306,18 @@ class PLBart(pl.LightningModule):
     def forward(self, *args, **kwargs):
         return self.model(*args, **kwargs)
 
-    def training_step(self, batch, batch_idx):
-        
+    def training_step(self, batch, batch_idx):        
+        if self.curriculum_mode != "no_curriculum":
+            arm, batch = batch
+            self._active_arm = arm
+            self.log("active_arm", self._active_arm)
+            
         outputs = self(**batch)
         self.log("train_loss", outputs.loss, **self.logging_conf)
 
-        if self.compute_pg:
-            self.active_batch = batch
-            self.active_true_loss = outputs.loss
+        if self.curriculum_mode != "no_curriculum":
+            self._active_batch = batch
+            self._active_loss = outputs.loss
 
         if self.use_label_smoothing:
             loss = self.label_smoother(outputs, batch["labels"])
@@ -324,10 +330,11 @@ class PLBart(pl.LightningModule):
     def backward(self, loss, optimizer, optimizer_idx):
         super().backward(loss, optimizer, optimizer_idx)
 
-        if self.compute_pg:
-            # Active true loss is the loss for the current batch
-            # without label smoothing.
-            pg = self.active_true_loss - self.model(**self.active_batch)
+        if self.curriculum_mode != "no_curriculum":
+            self.cluster_picker.update(
+                self._active_arm, 
+                (self._active_loss - self.model(**self._active_batch).loss).detach().cpu().numpy(),
+            )
             
 
     def validation_step(self, batch_package, batch_idx):
@@ -342,26 +349,29 @@ class PLBart(pl.LightningModule):
                 **self.generation_kwargs, 
             )
 
+            types_of_preds = [("regular", preds)]
+            if self.do_allen_nlp_predictions:
+                allen_ai_inputs = dict(
+                    tokens=dict(
+                        token_ids=batch["input_ids"], 
+                        mask=batch["attention_mask"],
+                    )
+                )
 
-            allen_ai_inputs = dict(
-                tokens=dict(token_ids=batch["input_ids"], 
-                mask=batch["attention_mask"],
-            ))
-            allen_ai_outputs = dict(tokens=dict(
-                token_ids=batch["decoder_input_ids"], 
-                mask=batch["decoder_input_ids"] != 1,
-            ))
-            allen_ai_preds = self.allen_ai_bart.forward(
-                source_tokens=allen_ai_inputs,
-                target_tokens=allen_ai_outputs,
-            )["predictions"]
+                allen_ai_preds = self.allen_ai_bart.forward(
+                    source_tokens=allen_ai_inputs,
+                )["predictions"]
+                types_of_preds.append(("allen_nlp", allen_ai_preds))
 
-            for pred_type, preds_intance in (("reg", preds), ("allen_ai", allen_ai_preds)):
+            for pred_type, preds_intance in types_of_preds:
                 em = EM()
                 recall_accuracy = RecallAcc()
                 precision_accuracy = PrecisionAcc()
 
-                for i, (x, pred, label) in enumerate(zip(batch["input_ids"], preds_intance, batch["labels"])):
+                for i, (x, pred, label) in enumerate(
+                    zip(batch["input_ids"], preds_intance, batch["labels"])
+                ):
+
                     do_print = batch_idx == 0 and i < 5
                     cleaned = OurMetric.prepare(
                         x, self.tokenizer, pred, label, do_print=do_print
@@ -372,20 +382,21 @@ class PLBart(pl.LightningModule):
                     assert isinstance(clean_pred,  list), type(clean_pred ).mro()
                     assert isinstance(clean_label, list), type(clean_label).mro()
 
-                    em                .add(clean_pred, clean_label, do_print=do_print)
+                    em                .add(clean_pred, clean_label, do_print=do_print, descr=f"")
                     recall_accuracy   .add(clean_pred, clean_label, do_print=do_print)
                     precision_accuracy.add(clean_pred, clean_label, do_print=do_print)
 
                 em_acc_val =         em.compute()
                 recall_acc_val =     recall_accuracy.compute()
                 precision_acc_val =  precision_accuracy.compute()
-                f1_ACC =             2 * precision_acc_val * recall_acc_val / (precision_acc_val + recall_acc_val)
+                # f1_ACC =             2 * precision_acc_val * recall_acc_val (precision_acc_val + recall_acc_val)
                 
-                self.log(f"{name}_{pred_type}_loss",           loss,               **self.logging_conf)
+                rich.print(f"[orange]{name}_{pred_type} - GOT {em.correct}/{em.total} = {em.correct / em.total:.2%}")
                 self.log(f"{name}_{pred_type}_EM",             em_acc_val,         **self.logging_conf)
-                self.log(f"{name}_{pred_type}_recall_ACC",     recall_acc_val,     **self.logging_conf)
-                self.log(f"{name}_{pred_type}_precision_ACC",  precision_acc_val,  **self.logging_conf)
-                self.log(f"{name}_{pred_type}_f1_ACC",         f1_ACC,             **self.logging_conf)
+                self.log(f"{name}_{pred_type}_loss",           loss,               **self.logging_conf)
+                # self.log(f"{name}_{pred_type}_recall_ACC",     recall_acc_val,     **self.logging_conf)
+                # self.log(f"{name}_{pred_type}_precision_ACC",  precision_acc_val,  **self.logging_conf)
+                # self.log(f"{name}_{pred_type}_f1_ACC",         f1_ACC,             **self.logging_conf)
 
         self.allen_ai_bart.training = True
 
@@ -397,9 +408,9 @@ class PLBart(pl.LightningModule):
         https://pytorch-lightning.readthedocs.io/en/stable/api/pytorch_lightning.core.lightning.html#pytorch_lightning.core.lightning.LightningModule.configure_optimizers
         """
         if self.is_adamw: 
-            optimizer_class = transformers.AdamW
+            optimizer_class = torch.optim.AdamW
         else:
-            optimizer_class = transformers.Adam
+            optimizer_class = torch.optim.Adam
 
         optimizer = optimizer_class(
             self.parameters(), 
@@ -420,7 +431,7 @@ class PLBart(pl.LightningModule):
         return output
 
 
-    def make_dataloader(self, ds, batch_size):
+    def _make_dataloader(self, ds, batch_size):
         return torch.utils.data.DataLoader(
             ds, 
             collate_fn=transformers.data.data_collator.DataCollatorForSeq2Seq(
@@ -432,17 +443,44 @@ class PLBart(pl.LightningModule):
         ) 
 
     def train_dataloader(self):
-        return self.make_dataloader(self.train_ds, self.batch_size)
+        assert not self.already_started
+        self.already_started = True
+
+        if self.curriculum_mode == "no_curriculum": 
+            return self._make_dataloader(self.train_ds, self.batch_size)
+
+        elif self.curriculum_mode == "length":
+            num_clusters = 5
+            
+            no_null_padding = not any(
+                np.any(x == 0) for x in self.train_ds["attention_mask"]
+            )
+            assert no_null_padding 
+
+
+            return auto_curriculum.LengthAutoCurriculumDL(
+                dataset=self.train_ds, 
+                field_name="input_ids", 
+                batch_size=self.batch_size, 
+                num_clusters=num_clusters,
+                cluster_picker=self.cluster_picker, 
+                collator=transformers.data.data_collator.DataCollatorForSeq2Seq(
+                    self.tokenizer, model=self.model, padding=True
+                )
+            )
+        else:
+            raise ValueError(f"Unknown curriculum mode: {self.curriculum_mode}")
+
 
     def val_dataloader(self):
         return pl.trainer.supporters.CombinedLoader(
             dict(
-                eval=self.make_dataloader(
+                eval=self._make_dataloader(
                     self.eval_ds,
                     self.eval_batch_size
                 ), 
-                gen=self.make_dataloader(
-                    self.eval_ds,
+                gen=self._make_dataloader(
+                    self.gen_ds,
                     self.eval_batch_size
                 ), 
             ),
@@ -456,15 +494,53 @@ class PLBart(pl.LightningModule):
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # CAN CHANGE.
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~.
-RUN_NAME = "WITH FORCE BOS 0, WD NO LABEL SMOOTHING"
+CURRICULUM_TYPE = "linear_curriculum"
+CURRICULUM_MODE = "length"
 
+if CURRICULUM_TYPE == "ns_epsilon_greedy":
+    CURRICULUM_ARGS = dict(
+        num_arms=           5, 
+        average_class=      auto_curriculum.EMA, 
+        average_class_args= dict(
+            alpha=   0.2, 
+            default= 0.
+        ), 
+        epsilon=            1,
+    )
+elif CURRICULUM_TYPE == "exp3":
+    CURRICULUM_ARGS = dict(
+        num_arms = 5
+    )
+elif CURRICULUM_TYPE == "linear_curriculum":
+    CURRICULUM_ARGS = dict(
+        num_arms=           5,
+        max_num_steps=      1000
+    )
+elif CURRICULUM_TYPE == "no_curriculum":
+    assert CURRICULUM_MODE == "no_curriculum"
+else:
+    raise ValueError(CURRICULUM_TYPE)
+
+if CURRICULUM_MODE == "no_curriculum":
+    assert CURRICULUM_TYPE == "no_curriculum"
+
+CURRICULUM_TYPES = dict(
+    ns_epsilon_greedy=auto_curriculum.NSEpsilonGreedy,
+    linear_curriculum=auto_curriculum.LinearCurriculum,
+    exp3=auto_curriculum.Exp3,
+)
+
+####
+##
+####
+RUN_NAME = f"{CURRICULUM_TYPE}-{CURRICULUM_MODE} - 1000 steps"
 RANDOM_SEED = 42
 
 #####
 ## Logging / Eval frequency
 #####
-VAL_CHECK_INTERVAL = None
-CHECK_VAL_EVERY_N_EPOCH = 5
+VAL_CHECK_INTERVAL = 300
+CHECK_VAL_EVERY_N_EPOCH = None
 LOG_EVERY_N_STEPS = 1
 LIMIT_VAL_BATCHES = 5
 
@@ -479,7 +555,7 @@ class Config:
     use_label_smoothing: bool = False
     learning_rate: float =      (1e-4) 
     is_adamw: bool =            True
-    weight_decay: float =       0.01 
+    weight_decay: float =       0.01
     scheduler_type: str =       "no_scheduler"
     scheduler_kwargs: dict =    field(default_factory=lambda : dict())
 
@@ -492,8 +568,8 @@ class Config:
 ######
 NUM_GPUS = torch.cuda.device_count()
 NUM_TOTAL_BATCH_SEEN = 512
-TRAIN_BATCH_SIZE = 64 * 2
-EVAL_BATCH_SIZE = TRAIN_BATCH_SIZE
+TRAIN_BATCH_SIZE = 64 
+EVAL_BATCH_SIZE = int(TRAIN_BATCH_SIZE / 2)
 ACCUMULATE_GRAD_BATCHES = round(NUM_GPUS * NUM_TOTAL_BATCH_SEEN / TRAIN_BATCH_SIZE)
 assert NUM_TOTAL_BATCH_SEEN % TRAIN_BATCH_SIZE == 0, (
     f"{NUM_TOTAL_BATCH_SEEN % TRAIN_BATCH_SIZE} != 0"
@@ -508,6 +584,7 @@ assert TRAIN_BATCH_SIZE * ACCUMULATE_GRAD_BATCHES == NUM_TOTAL_BATCH_SEEN, (
 GENERATION_KWARGS = dict(
     num_beams=4,
     max_length=500,
+    no_repeat_ngram_size=0,
 )
 
 ######
@@ -527,8 +604,9 @@ GEN_MD5 = "e6d4a859a25af9ba3319b2a27815a181"
 
 
 #####
-## Varia that should be changed.
+## Varia that shouldn't be changed.
 #####
+DO_ALLEN_NLP_PREDICTIONS = False
 MODEL_NAME = "facebook/bart-base"
 TRAIN_MAX_EPOCHS = 80
 NUM_WORKERS_DL = get_nprocs()
@@ -556,7 +634,7 @@ def main(
     maybe_download(GEN_PATH,   GEN_URL,   GEN_MD5  )
 
     model_name = MODEL_NAME
-    model = transformers.AutoModelForSeq2SeqLM.from_pretrained(model_name, forced_bos_token_id=0)
+    model = transformers.AutoModelForSeq2SeqLM.from_pretrained(model_name,)
     tokenizer = transformers.AutoTokenizer.from_pretrained(model_name)
 
     train_x, train_y = load_dataset(TRAIN_PATH)
@@ -567,22 +645,35 @@ def main(
     eval_ds  = prepare_ds(tokenizer, eval_x,  eval_y )
     gen_ds   = prepare_ds(tokenizer, gen_x,   gen_y  )
 
+    assert (
+        "no_repeat_ngram_size" in GENERATION_KWARGS and 
+        GENERATION_KWARGS["no_repeat_ngram_size"] == 0
+    ), GENERATION_KWARGS.get("no_repeat_ngram_size", "<Not contained>")
+
+
+    curriculum_instance = CURRICULUM_TYPES[CURRICULUM_TYPE](
+        **CURRICULUM_ARGS
+    )
+
     pl_model = PLBart(
-        model=               model, 
-        tokenizer=           tokenizer, 
-        train_ds=            train_ds, 
-        eval_ds=             eval_ds,
-        gen_ds=              gen_ds,
-        train_batch_size=    TRAIN_BATCH_SIZE, 
-        eval_batch_size=     EVAL_BATCH_SIZE, 
-        num_workers_dl=      NUM_WORKERS_DL, 
-        generation_kwargs=   GENERATION_KWARGS,
-        use_label_smoothing= config.use_label_smoothing,
-        learning_rate=       config.learning_rate,
-        is_adamw=            config.is_adamw,
-        weight_decay=        config.weight_decay,
-        scheduler_type=      config.scheduler_type,
-        scheduler_kwargs=    config.scheduler_kwargs,
+        model=                    model, 
+        tokenizer=                tokenizer, 
+        curriculum_mode=          CURRICULUM_MODE,
+        train_ds=                 train_ds, 
+        eval_ds=                  eval_ds,
+        gen_ds=                   gen_ds,
+        train_batch_size=         TRAIN_BATCH_SIZE, 
+        eval_batch_size=          EVAL_BATCH_SIZE, 
+        num_workers_dl=           NUM_WORKERS_DL, 
+        generation_kwargs=        GENERATION_KWARGS,
+        use_label_smoothing=      config.use_label_smoothing,
+        learning_rate=            config.learning_rate,
+        is_adamw=                 config.is_adamw,
+        weight_decay=             config.weight_decay,
+        scheduler_type=           config.scheduler_type,
+        scheduler_kwargs=         config.scheduler_kwargs,
+        do_allen_nlp_predictions= DO_ALLEN_NLP_PREDICTIONS,
+        curriculum_instance=      curriculum_instance,
     )
 
     trainer = pl.Trainer(
@@ -598,11 +689,14 @@ def main(
                 **vars(config),
                 num_gpus=          NUM_GPUS,
                 train_batch_size=  TRAIN_BATCH_SIZE,
+                curriculum_args=   CURRICULUM_ARGS,
+                curriculum_type=   CURRICULUM_TYPE,
+                curriculum_mode=   CURRICULUM_MODE,
             )
         ),
         
         val_check_interval=      VAL_CHECK_INTERVAL,
-        check_val_every_n_epoch= CHECK_VAL_EVERY_N_EPOCH,
+        # check_val_every_n_epoch= CHECK_VAL_EVERY_N_EPOCH,
 
         log_every_n_steps=       LOG_EVERY_N_STEPS,
         limit_val_batches=       LIMIT_VAL_BATCHES,
